@@ -1,0 +1,327 @@
+---
+- name: Add CNAME record for www in zone file
+  lineinfile:
+    path: "/etc/named/{{ hostname }}{{ domain_name }}"
+    insertafter: '^{{hostname }} IN A {{ external_ip }}'
+    line: 'www IN CNAME {{ hostname }}{{ domain_name }}.'
+
+- name: Install Apache Web Server
+  dnf:
+    name: httpd
+    state: present
+
+- name: Open port 80
+  firewalld:
+    port: "80/tcp"
+    state: enabled
+    permanent: yes
+
+- name: restart firewalld
+  systemd:
+    daemon_reload: yes
+    name: firewalld
+    state: restarted
+    enabled: yes
+
+- name: start httpd
+  systemd:
+    daemon_reload: yes
+    name: httpd
+    state: restarted
+    enabled: yes
+
+- name: Create virtual host
+  file:
+    path: "/etc/httpd/conf.d/www.{{ hostname }}{{ domain_name }}.conf"
+    state: touch
+
+- name: Check if host is already defined
+  lineinfile:
+    state: absent
+    path: "/etc/httpd/conf.d/www.{{ hostname }}{{ domain_name }}.conf"
+    regexp: "^<VirtualHost \\*:80>"
+  check_mode: true
+  register: check
+
+- name: Add VirtualHost configuration
+  lineinfile:
+    path: "/etc/httpd/conf.d/www.{{ hostname }}{{ domain_name }}.conf"
+    line: |
+      <VirtualHost *:80>
+          ServerName www.{{ hostname }}{{ domain_name }}
+          DocumentRoot /var/www/html/www.{{ hostname }}/public_html
+          # Possible values include: debug, info, notice, warn, error, crit, alert, emerg.
+          LogLevel debug
+          ErrorLog /var/log/httpd/www.{{ hostname }}-error.log
+          CustomLog /var/log/httpd/www.{{ hostname }}-access.log combined
+          ForensicLog /var/log/httpd/wordpress-forensic.log
+      </VirtualHost>
+    state: present
+    notify:
+       - start httpd
+  when: check.found == 0
+
+- name: Install PIP
+  dnf:
+    name: python3-pip
+    state: present
+
+- name: Install Flask library
+  pip:
+    name: flask
+    executable: pip3
+    state: present
+
+- name: Create Flask application file
+  copy:
+    content: |
+      #!/bin/env python3
+      
+      from flask import Flask
+      app = Flask(__name__)
+      
+      @app.route("/")
+      def hello():
+          return "Hello World!"
+      
+      if __name__ == "__main__":
+          app.run(port=5000)
+    dest: /root/website.py
+    mode: "0755"
+
+- name: Add dns record
+  lineinfile:
+    path: "/etc/named/{{ hostname }}{{ domain_name }}"
+    insertafter: '^www IN CNAME {{ hostname }}{{ domain_name }}'
+    line: 'proxy IN CNAME {{ hostname }}{{ domain_name }}.'
+
+- name: Setsebool to allow HTTPD to connect to Python program
+  command:
+    cmd: setsebool -P httpd_can_network_connect=1
+
+- name: Create proxy.conf
+  file:
+    path: "/etc/httpd/conf.d/proxy.conf"
+    state: touch
+
+- name: Check if host is already defined
+  lineinfile:
+    state: absent
+    path: "/etc/httpd/conf.d/proxy.conf"
+    regexp: "^<VirtualHost \\*:80>"
+  check_mode: true
+  register: check
+
+- name: Add VirtualHost configuration 
+  lineinfile:
+    path: "/etc/httpd/conf.d/proxy.conf"
+    line: |
+      <VirtualHost *:80>
+          ServerName proxy.{{ hostname }}{{ domain_name }}
+          # ServerName sets the name to listen for with requests
+          ErrorLog /var/log/httpd/proxy-error_log
+          CustomLog /var/log/httpd/proxy-access_log common
+          ForensicLog /var/log/httpd/wordpress-forensic.log
+          ProxyPreserveHost On
+
+          ProxyPass / http://localhost:5000/
+          ProxyPassReverse / http://localhost:5000/
+      </VirtualHost>
+    state: present
+  when: check.found == 0
+
+- name: Stop the proxy server
+  service:
+    name: proxy
+    state: stopped
+
+- name: Create proxy user
+  user:
+    name: proxy
+    state: present
+
+- name: Move python file to /usr/local/lib/server.py
+  file:
+    src: "/root/website.py"
+    dest: /usr/local/lib/server.py
+    state: link
+    force: no
+  ignore_errors: true
+
+- name: Change ownership of python file to proxy user
+  file:
+    path: /usr/local/lib/server.py
+    owner: proxy
+    group: proxy
+
+- name: Create systemd unit file for proxy service
+  copy:
+    content: |
+      [Unit]
+      Description=Python Proxy Service
+
+      [Service]
+      ExecStart=/usr/bin/python3 /usr/local/lib/server.py
+      Environment=PYTHONUNBUFFERED=1
+      Restart=on-failure
+      Type=simple
+      User=proxy
+
+      [Install]
+      WantedBy=default.target
+    dest: /etc/systemd/system/proxy.service
+    mode: "0644"
+
+- name: Reload systemctl service files
+  command:
+    cmd: systemctl daemon-reload
+
+- name: restart proxy
+  systemd:
+    daemon_reload: yes
+    name: proxy
+    state: restarted
+    enabled: yes
+
+- name: Install required packages
+  dnf:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - php-mysqlnd
+    - php-fpm
+    - mariadb-server
+    - httpd
+    - tar
+    - curl
+    - php-json
+
+- name: start mariadb
+  systemd:
+    daemon_reload: yes
+    name: mariadb
+    state: restarted
+    enabled: yes
+
+- name: Check if WordPress directory exists
+  stat:
+    path: /var/www/html/wordpress
+  register: wordpress_directory
+
+- name: Copy WordPress directory to /var/www/html
+  copy:
+    src: /home/centos/wordpress
+    dest: /var/www/html
+    remote_src: yes
+  when: not wordpress_directory.stat.exists
+
+- name: Change ownership of WordPress directory
+  file:
+    path: /var/www/html/wordpress
+    owner: apache
+    group: apache
+    recurse: yes
+
+- name: Change SELinux context for WordPress directory
+  command:
+    cmd: chcon -t httpd_sys_rw_content_t /var/www/html/wordpress -R
+
+- name: Add CNAME record
+  lineinfile:
+    path: "/etc/named/{{ hostname }}{{ domain_name }}"
+    line: 'wordpress IN CNAME {{ hostname }}{{ domain_name }}.'
+
+- name: Create Wordpress config
+  file:
+    path: "/etc/httpd/conf.d/wordpress.{{ hostname }}{{ domain_name }}.conf"
+    state: touch
+
+- name: Check if host is already defined
+  lineinfile:
+    state: absent
+    path: "/etc/httpd/conf.d/wordpress.{{ hostname }}{{ domain_name }}.conf"
+    regexp: "^<VirtualHost \\*:80>"
+  check_mode: true
+  register: check
+
+- name: Add VirtualHost configuration
+  lineinfile:
+    path: "/etc/httpd/conf.d/wordpress.{{ hostname }}{{ domain_name }}.conf"
+    line: |
+      <VirtualHost *:80>
+          ServerName wordpress.{{ hostname }}{{ domain_name }}
+          # ServerName sets the name to listen for with requests
+          DocumentRoot /var/www/html/wordpress
+          LogLevel warn
+          ErrorLog /var/log/httpd/php-errors.log
+          CustomLog /var/log/httpd/www-php-errors.log combined
+          ForensicLog /var/log/httpd/wordpress-forensic.log
+      </VirtualHost>
+    state: present
+  when: check.found == 0
+
+- name: start httpd
+  systemd:
+    daemon_reload: yes
+    name: httpd
+    state: restarted
+    enabled: yes
+
+- name: start php-fpm
+  systemd:
+    daemon_reload: yes
+    name: php-fpm
+    state: started
+    enabled: yes
+
+- name: Load mod_log_forensic module in httpd.conf
+  lineinfile:
+    path: /etc/httpd/conf/httpd.conf
+    line: "LoadModule log_forensic_module modules/mod_log_forensic.so"
+    insertafter: EOF
+
+- name: Create log files for www virtual host
+  file:
+    path: "/var/log/httpd/www-forensic.log"
+    state: touch
+    owner: apache
+    group: apache
+    mode: "0644"
+
+- name: Create log files for wordpress virtual host
+  file:
+    path: "/var/log/httpd/wordpress-forensic.log"
+    state: touch
+    owner: apache
+    group: apache
+    mode: "0644"
+
+- name: Check if custom local rules block already exists in modsecurity_localrules.conf
+  stat:
+    path: /etc/httpd/modsecurity.d/local_rules/modsecurity_localrules.conf
+  register: block_file_status
+
+- name: Append custom local rules to modsecurity_localrules.conf
+  blockinfile:
+    path: /etc/httpd/modsecurity.d/local_rules/modsecurity_localrules.conf
+    block: |
+      # default action when matching rules
+      SecDefaultAction "phase:2,deny,log,status:406"
+
+      # [etc/passwd] is included in request URI
+      SecRule REQUEST_URI "etc/passwd" "id:'500001'"
+
+      # [../] is included in request URI
+      SecRule REQUEST_URI "\.\./" "id:'500002'"
+
+      # [<SCRIPT] is included in arguments
+      SecRule ARGS "<[Ss][Cc][Rr][Ii][Pp][Tt]" "id:'500003'"
+    create: yes
+  when: block_file_status.stat.exists == False
+
+- name: start httpd
+  systemd:
+    daemon_reload: yes
+    name: httpd
+    state: restarted
+    enabled: yes

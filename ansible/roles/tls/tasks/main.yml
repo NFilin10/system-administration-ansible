@@ -1,0 +1,137 @@
+---
+- name: Open ports
+  firewalld:
+    port: "443/tcp"
+    state: enabled
+    permanent: yes
+
+
+- name: Install mod_ssl
+  dnf:
+    name: mod_ssl
+    state: present
+
+- name: restart firewalld
+  systemd:
+    daemon_reload: yes
+    name: firewalld
+    state: restarted
+    enabled: yes
+
+- name: Create VirtualHost configuration for mail
+  lineinfile:
+    dest: "/etc/httpd/conf.d/mail.{{ hostname }}{{ domain_name }}.conf"
+    line: |
+          <VirtualHost *:443>
+            ServerAdmin root@{{ hostname }}{{ domain_name }}
+            ServerName mail.{{ hostname }}{{ domain_name }}
+            DocumentRoot /var/www/html/roundcubemail
+            <Directory /var/www/html/roundcubemail>
+                AllowOverride all
+            </Directory>
+            SSLEngine on
+            SSLCertificateFile /etc/pki/tls/certs/www_server.crt
+            SSLCertificateKeyFile /etc/pki/tls/private/www_server.key
+            SSLCACertificateFile /etc/pki/tls/certs/cacert.crt
+            ErrorLog /var/log/httpd/mail.{{ hostname }}{{ domain_name }}-error.log
+            CustomLog /var/log/httpd/mail.{{ hostname }}{{ domain_name }}-access.log combined
+            ForensicLog /var/log/httpd/mail.{{ hostname }}{{ domain_name }}-forensic.log
+          </VirtualHost>
+
+- name: Create VirtualHost configuration for www
+  lineinfile:
+    dest: "/etc/httpd/conf.d/www.{{ hostname }}{{ domain_name }}.conf"
+    line: |
+          <VirtualHost *:443>
+            ServerAdmin root@{{ hostname }}{{ domain_name }}
+            ServerName www.{{ hostname }}{{ domain_name }}
+            DocumentRoot /var/www/html/roundcubemail
+            <Directory /var/www/html/roundcubemail>
+                AllowOverride all
+            </Directory>
+            SSLEngine on
+            SSLCertificateFile /etc/pki/tls/certs/www_server.crt
+            SSLCertificateKeyFile /etc/pki/tls/private/www_server.key
+            SSLCACertificateFile /etc/pki/tls/certs/cacert.crt
+            ErrorLog /var/log/httpd/mail.{{ hostname }}{{ domain_name }}-error.log
+            CustomLog /var/log/httpd/mail.{{ hostname }}{{ domain_name }}-access.log combined
+            ForensicLog /var/log/httpd/mail.{{ hostname }}{{ domain_name }}-forensic.log
+          </VirtualHost>
+
+
+- name: Create VirtualHost configuration for WP
+  lineinfile:
+    dest: "/etc/httpd/conf.d/wordpress.{{ hostname }}{{ domain_name }}.conf"
+    line: |
+          <VirtualHost *:443>
+            ServerAdmin root@{{ hostname }}{{ domain_name }}
+            ServerName name.{{ hostname }}{{ domain_name }}
+            DocumentRoot /var/www/html/wordpress
+
+            SSLEngine on
+            SSLCertificateFile /etc/pki/tls/certs/www_server.crt
+            SSLCertificateKeyFile /etc/pki/tls/private/www_server.key
+            SSLCACertificateFile /etc/pki/tls/certs/cacert.crt
+            ErrorLog /var/log/httpd/php-errors.log
+            CustomLog /var/log/httpd/www-php-errors.log combined
+            ForensicLog /var/log/httpd/wordpress-forensic.log
+          </VirtualHost>
+
+- name: Update Postfix main.cf configuration
+  lineinfile:
+    path: /etc/postfix/main.cf
+    state: present
+    regexp: '^{{ item.key }}'
+    line: '{{ item.key }} = {{ item.value }}'
+    backup: yes
+  with_items:
+    - { key: 'smtpd_tls_security_level', value: 'may' }
+    - { key: 'smtpd_tls_cert_file', value: '/etc/pki/tls/certs/postfix.pem' }
+    - { key: 'smtpd_tls_key_file', value: '/etc/pki/tls/private/postfix.key' }
+    - { key: 'smtpd_tls_loglevel', value: '1' }
+    - { key: 'smtp_tls_loglevel', value: '1' }
+
+- name: Enable smtps service
+  lineinfile:
+    path: /etc/postfix/master.cf
+    state: present
+    regexp: '^#?smtps'
+    line: 'smtps     inet  n       -       n       -       -       smtpd'
+
+- name: Ensure smtps options are configured
+  blockinfile:
+    path: /etc/postfix/master.cf
+    insertafter: '^smtps.*smtpd'
+    block: |
+          -o syslog_name=postfix/smtps
+          -o smtpd_tls_wrappermode=yes
+          -o smtpd_sasl_auth_enable=yes
+          -o smtpd_sasl_path=private/auth
+          -o smtpd_sasl_security_options=noanonymous
+          -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+          -o smtpd_relay_restrictions=permit_sasl_authenticated,reject
+          -o milter_macro_daemon_name=ORIGINATING
+
+- name: Set ssl parameters
+  blockinfile:
+    path: /etc/dovecot/conf.d/10-ssl.conf
+    block: |
+          ssl = yes
+          ssl_cert = </etc/pki/dovecot/certs/dovecot.pem
+          ssl_key = </etc/pki/dovecot/private/dovecot.pem
+
+- name: restart named
+  systemd:
+    daemon_reload: yes
+    name: named
+    state: restarted
+    enabled: yes
+
+- name: restart httpd
+  systemd:
+    daemon_reload: yes
+    name: httpd
+    state: restarted
+    enabled: yes
+
+

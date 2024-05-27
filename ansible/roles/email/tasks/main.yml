@@ -1,0 +1,366 @@
+---
+- name: Open ports
+  firewalld:
+    port: "{{ item }}"
+    state: enabled
+    permanent: yes
+  loop:
+    - "25/tcp"
+    - "465/tcp"
+    - "587/tcp"
+    - "143/tcp"
+    - "993/tcp"
+  
+- name: restart firewalld
+  systemd:
+    daemon_reload: yes
+    name: firewalld
+    state: restarted
+    enabled: yes
+
+- name: Add A record for email
+  lineinfile:
+    path: "/etc/named/{{ hostname }}{{ domain_name }}"
+    line: 'mail.{{ hostname }}{{ domain_name }}.  IN  A {{ external_ip }}'
+
+- name: Add MX record for email
+  lineinfile:
+    path: "/etc/named/{{ hostname }}{{ domain_name }}"
+    line: '@  IN  MX  10  mail.{{ hostname }}{{ domain_name }}.'
+
+- name: Ensure Postfix is installed
+  dnf:
+    name: postfix
+    state: present
+
+- name: Ensure inet_protocols is set to ipv4
+  lineinfile:
+    path: /etc/postfix/main.cf
+    regexp: '^inet_protocols ='
+    line: 'inet_protocols = ipv4'
+
+- name: Set myhostname
+  lineinfile:
+    path: /etc/postfix/main.cf
+    regexp: '^myhostname ='
+    line: 'myhostname = mail.{{ hostname }}{{ domain_name }}'
+
+- name: Ensure mydomain is not explicitly set
+  replace:
+    path: /etc/postfix/main.cf
+    regexp: '^mydomain ='
+    replace: 'mydomain = $hostname'
+
+- name: Set inet_interfaces to all
+  lineinfile:
+    path: /etc/postfix/main.cf
+    regexp: '^inet_interfaces ='
+    line: 'inet_interfaces = all'
+
+- name: Set myorigin
+  lineinfile:
+    path: /etc/postfix/main.cf
+    regexp: '^myorigin ='
+    line: 'myorigin = $mydomain'
+
+- name: Set mydestination
+  lineinfile:
+    path: /etc/postfix/main.cf
+    regexp: '^mydestination ='
+    line: |
+          mydestination = mail.{{ hostname }}{{ domain_name }},
+                         localhost.{{ hostname }}{{ domain_name }},
+                         localhost,
+                         {{ hostname }}{{ domain_name }}
+
+- name: Ensure relayhost is not set
+  replace:
+    path: /etc/postfix/main.cf
+    regexp: '^relayhost ='
+    replace: '#relayhost ='
+
+- name: Ensure mynetworks is not set
+  replace:
+    path: /etc/postfix/main.cf
+    regexp: '^mynetworks ='
+    replace: '#mynetworks ='
+
+- name: Set mynetworks_style to host
+  lineinfile:
+    path: /etc/postfix/main.cf
+    regexp: '^mynetworks_style ='
+    line: 'mynetworks_style = host'
+
+- name: start postfix
+  systemd:
+    daemon_reload: yes
+    name: postfix
+    state: started
+    enabled: yes
+
+- name: start named
+  systemd:
+    daemon_reload: yes
+    name: named
+    state: started
+    enabled: yes
+
+- name: Set mail_debug to yes
+  lineinfile:
+    path: /etc/dovecot/conf.d/10-logging.conf
+    regexp: '^mail_debug ='
+    line: 'mail_debug = yes'
+
+- name: Allow imap and lmtp protocols
+  lineinfile:
+    path: /etc/dovecot/dovecot.conf
+    regexp: '^protocols ='
+    line: 'protocols = imap lmtp'
+
+- name: Set auth_mechanisms to allow plain and login
+  lineinfile:
+    path: /etc/dovecot/conf.d/10-auth.conf
+    regexp: '^auth_mechanisms ='
+    line: 'auth_mechanisms = plain login'
+
+- name: Set auth_username_format to %n
+  lineinfile:
+    path: /etc/dovecot/conf.d/10-auth.conf
+    regexp: '^auth_username_format ='
+    line: 'auth_username_format = %n'
+
+- name: Create Dovecot mail directory
+  file:
+    path: ~/mail
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0700'
+
+- name: Set mail_location
+  lineinfile:
+    path: /etc/dovecot/conf.d/10-mail.conf
+    regexp: '^mail_location ='
+    line: 'mail_location = maildir:~/mail'
+
+- name: Add dovecot user to the mail group
+  command: "usermod -aG mail dovecot"
+
+- name: Define mailbox Trash
+  blockinfile:
+    path: /etc/dovecot/conf.d/15-mailboxes.conf
+    block: |
+          mailbox Trash {
+            auto = create
+            special_use = \Trash
+          }
+    insertafter: 'namespace inbox {'
+
+- name: Define mailbox Spam
+  blockinfile:
+    path: /etc/dovecot/conf.d/15-mailboxes.conf
+    block: |
+          mailbox Spam {
+            auto = create
+            special_use = \Junk
+          }
+    insertafter: 'namespace inbox {'
+
+- name: Start named service
+  service:
+    name: dovecot
+    state: started
+
+- name: Define the LMTP listener in 10-master.conf
+  blockinfile:
+    path: /etc/dovecot/conf.d/10-master.conf
+    block: |
+          service lmtp {
+            unix_listener /var/spool/postfix/private/dovecot-lmtp {
+              mode = 0600
+              user = postfix
+              group = postfix
+            }
+          }
+    state: present
+
+- name: Set mailbox_transport to lmtp:unix:private/dovecot-lmtp in postfix main.cf
+  lineinfile:
+    path: /etc/postfix/main.cf
+    regexp: '^mailbox_transport ='
+    line: 'mailbox_transport = lmtp:unix:private/dovecot-lmtp'
+
+- name: Ensure submission section in master.cf for port 587
+  blockinfile:
+    path: /etc/postfix/master.cf
+    block: |
+          submission inet n       -       n       -       -       smtpd
+            -o syslog_name=postfix/submission
+            -o smtpd_sasl_auth_enable=yes
+            -o smtpd_recipient_restrictions=permit_mynetworks,permit_sasl_authenticated,reject
+            -o smtpd_relay_restrictions=permit_sasl_authenticated,reject
+            -o smtpd_sasl_type=dovecot
+            -o smtpd_sasl_path=private/auth
+    insertafter: '^#submission inet n       -       n       -       -       smtpd'
+    state: present
+
+- name: Define the UNIX listener for the auth service in 10-master.conf if not exists
+  blockinfile:
+    path: /etc/dovecot/conf.d/10-master.conf
+    block: |
+          service auth {
+            unix_listener /var/spool/postfix/private/auth {
+              mode = 0600
+              user = postfix
+              group = postfix
+            }
+          }
+    state: present
+
+- name: start dovecot
+  systemd:
+    daemon_reload: yes
+    name: dovecot
+    state: started
+    enabled: yes
+
+- name: start postfix
+  systemd:
+    daemon_reload: yes
+    name: postfix
+    state: started
+    enabled: yes
+
+- name: Install EPEL release and DNF plugins core
+  dnf:
+    name:
+      - epel-release
+      - dnf-plugins-core
+    state: present
+
+- name: Enable CRB repository
+  command: dnf config-manager --set-enabled crb
+
+- name: Install required packages
+  dnf:
+    name:
+      - make
+      - ImageMagick
+      - ImageMagick-devel
+      - ImageMagick-perl
+      - pcre-devel
+      - zlib
+      - zlib-devel
+      - libzip
+      - libzip-devel
+      - libmcrypt-devel
+      - php
+      - php-fpm
+      - php-devel
+      - php-pear
+      - php-cli
+      - php-gd
+      - php-curl
+      - php-xml
+      - php-mysqlnd
+      - php-mbstring
+      - php-intl
+      - php-ldap
+      - mariadb
+      - mariadb-server
+      - httpd
+    state: present
+
+#- name: Install imagick extension using pecl
+#  command: pecl install imagick
+
+#- name: Install mcrypt extension using pecl
+#  command: pecl install mcrypt
+
+#- name: Install zip extension using pecl
+#  command: pecl install zip
+
+- name: Create 20-imagick.ini for imagick extension
+  copy:
+    dest: /etc/php.d/20-imagick.ini
+    content: |
+          extension=imagick
+
+- name: Create 20-mcrypt.ini for mcrypt extension
+  copy:
+    dest: /etc/php.d/20-mcrypt.ini
+    content: |
+          extension=mcrypt
+
+- name: Create 20-zip.ini for zip extension
+  copy:
+    dest: /etc/php.d/20-zip.ini
+    content: |
+          extension=zip
+
+- name: Ensure Roundcube directory exists
+  file:
+    path: /var/www/html/roundcubemail
+    state: directory
+
+- name: Set owner and group to apache
+  file:
+    path: /var/www/html/roundcubemail
+    owner: apache
+    group: apache
+    recurse: yes
+
+- name: Set permissions
+  file:
+    path: /var/www/html/roundcubemail
+    mode: '0755'
+    recurse: yes
+
+- name: Set SELinux context
+  command: chcon -t httpd_sys_rw_content_t /var/www/html/roundcubemail -R
+
+- name: Create  VirtualHost for Roundcube
+  copy:
+    dest: "/etc/httpd/conf.d/mail.{{ hostname }}{{ domain_name }}.conf"
+    content: |
+          <VirtualHost *:80>
+            ServerAdmin root@{{ hostname }}{{ domain_name }}
+            ServerName mail.{{ hostname }}{{ domain_name }}
+            DocumentRoot /var/www/html/roundcubemail
+            <Directory /var/www/html/roundcubemail>
+                AllowOverride all
+            </Directory>
+
+            ErrorLog /var/log/httpd/mail.{{ hostname }}{{ domain_name }}-error.log
+            CustomLog /var/log/httpd/mail.{{ hostname }}{{ domain_name }}-access.log combined
+            ForensicLog /var/log/httpd/mail.{{ hostname }}{{ domain_name }}-forensic.log
+          </VirtualHost>
+
+- name: Set permissions
+  file:
+    path: "/etc/httpd/conf.d/mail.{{ hostname }}{{ domain_name }}.conf"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Set correct permissions for config.inc.php
+  file:
+    path: /var/www/html/roundcubemail/config/config.inc.php
+    owner: apache
+    group: apache
+    mode: '0644'
+
+- name: restart named
+  systemd:
+    daemon_reload: yes
+    name: named
+    state: restarted
+    enabled: yes
+
+- name: restart httpd
+  systemd:
+    daemon_reload: yes
+    name: httpd
+    state: restarted
+    enabled: yes
+

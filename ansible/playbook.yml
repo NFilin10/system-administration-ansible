@@ -1,0 +1,8 @@
+- hosts: all
+  user: centos
+  become: yes
+  become_user: root
+  
+  roles:
+    - containers
+

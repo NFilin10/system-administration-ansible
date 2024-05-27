@@ -1,0 +1,223 @@
+---
+- name: Open ports
+  firewalld:
+    port: "{{ item }}"
+    state: enabled
+    permanent: yes
+  loop:
+    - "53/udp"
+    - "53/tcp"
+    - "8301/udp"
+    - "8301/tcp"
+
+- name: restart firewalld
+  systemd:
+    name: firewalld
+    state: restarted
+    daemon_reload: yes
+    enabled: yes
+
+- name: DNS | Autoremove unneeded packages installed as dependencies
+  dnf:
+    autoremove: yes
+
+- name: Disable IPv6
+  copy:
+    src: 70-ipv6.conf
+    dest: /etc/sysctl.d/70-ipv6.conf
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Change net.ipv6.conf.default.disable_ipv6 to 1.
+  sysctl:
+    name: net.ipv6.conf.default.disable_ipv6
+    value: '1'
+    sysctl_file: /etc/sysctl.d/70-ipv6.conf
+    reload: yes
+
+- name: Change net.ipv6.conf.all.disable_ipv6 to 1.
+  sysctl:
+    name: net.ipv6.conf.all.disable_ipv6
+    value: '1'
+    sysctl_file: /etc/sysctl.d/70-ipv6.conf
+    reload: yes
+
+- name: Inserts into hostname
+  template:
+    src: hostname.j2
+    dest: /etc/hostname
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Inserts into hosts
+  template:
+    src: hosts.j2
+    dest: /etc/hosts
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Install Bind
+  dnf:
+    name:
+      - bind
+      - bind-utils
+
+- name: Create log directory 
+  file:
+    path: /var/named/log
+    state: directory
+    owner: named
+    group: named
+    mode: '0755'
+
+- name: Create log files
+  file:
+    path: /var/named/log/{{ item }}
+    state: touch
+    owner: named
+    group: named
+    mode: '0644'
+  loop:
+    - default
+    - auth_servers
+    - zone_transfers
+    - client_security
+    - queries
+    - query-errors
+
+- name: Set owner and group for named.conf
+  file:
+    path: /etc/named.conf
+    owner: root
+    group: named
+    mode: '0640'
+
+- name: Ensure listen-on settings are configured in named.conf
+  lineinfile:
+    path: /etc/named.conf
+    line: "{{ item }}"
+    insertafter: 'options {'
+    state: present
+  loop:
+    - "listen-on port 53 { any; };"
+    - "listen-on-v6 port 53 { none; };"
+    - "allow-query     { any; };"
+    - "recursion yes;"
+    - "dnssec-validation no;"
+    - "minimal-responses no;"
+
+- name: Edit /etc/resolv.conf
+  become: yes
+  replace:
+    path: /etc/resolv.conf
+    regexp: '^nameserver.*'
+    replace: 'nameserver 127.0.0.1'
+
+- name: Change search option in /etc/resolv.conf
+  become: yes
+  lineinfile:
+    path: /etc/resolv.conf
+    line: 'search {{ hostname }}{{ domain_name }}'
+    regexp: '^search'
+    state: present
+
+- name: Check if the zone file exists
+  stat:
+    path: "/etc/named/{{ hostname }}{{ domain_name }}"
+  register: zone_file
+
+- name: Create the zone file if it doesn't exist
+  file:
+    path: "/etc/named/{{ hostname }}{{ domain_name }}"
+    state: touch
+    owner: root
+    group: named
+    mode: '0640'
+  when: not zone_file.stat.exists
+
+- name: Edit the zone file
+  blockinfile:
+    path: "/etc/named/{{ hostname }}{{ domain_name }}"
+    block: |
+      $TTL 15M
+      @           IN  SOA     ns1.{{ hostname }}{{ domain_name }}. root.{{ hostname }}{{ domain_name }}. (
+                          2012020101       ; Serial
+                          15M              ; Refresh
+                          5M               ; Retry
+                          120M             ; Expire
+                          600              ; Negative cache TTL
+                          )
+      @           IN  NS      ns1
+      @           IN  A       {{ external_ip }}
+      ns1         IN  A       {{ external_ip }}
+      {{ hostname }} IN A {{ external_ip }}
+  when: not zone_file.stat.exists
+
+
+#- name: Add zone clause for personal domain in named.conf
+#  lineinfile:
+#    path: /etc/named.conf
+#    line: "{{ item }}"
+#    insertafter: EOF
+#  loop:
+#    - 'zone "{{ hostname }}{{ domain_name }}" IN {'
+#    - '    type master;'
+#    - '    file "/etc/named/{{ hostname}}{{ domain_name }}";'
+#    - '    allow-update { none; };'
+#    - '}'
+
+- name: Check if the reverse zone file exists
+  stat:
+    path: "/etc/named/reverse.{{ hostname }}{{ domain_name }}"
+  register: reverse_zone_file
+
+- name: Create the reverse zone file if it doesn't exist
+  file:
+    path: "/etc/named/reverse.{{ hostname }}{{ domain_name }}"
+    state: touch
+    owner: root
+    group: named
+    mode: '0640'
+  when: not reverse_zone_file.stat.exists
+
+- name: Edit the reverse zone file
+  blockinfile:
+    path: "/etc/named/reverse.{{ hostname }}{{ domain_name }}"
+    block: |
+      $TTL 15M
+
+      @       IN      SOA     ns1.{{ hostname }}{{ domain_name }}. root.{{ hostname }}{{ domain_name }}. (
+                                2012020101 ; serial
+                                15M        ; Refresh
+                                5M         ; Retry
+                                120M       ; Expire
+                                600        ; Negative Cache TTL
+                                )
+
+      @              IN      NS      ns1.{{ hostname }}{{ domain_name }}.
+
+      83             IN      PTR     {{ hostname }}{{ domain_name }}.
+  when: not reverse_zone_file.stat.exists
+
+#- name: Add zone clause for personal domain in named.conf
+#  lineinfile:
+#    path: /etc/named.conf
+#    line: "{{ item }}"
+#    insertafter: EOF
+#  loop:
+#    - 'zone "{{ short_ip }}.in-addr.arpa" IN {'
+#    - '    type master;'
+#    - '    file "/etc/named/reverse.{{ hostname}}{{ domain_name }}";'
+#    - '    allow-update { none; };'
+#    - '}'
+
+- name: Start named service
+  systemd:
+    daemon_reload: yes
+    name: named
+    state: started
+    enabled: yes
+

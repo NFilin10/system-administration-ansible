@@ -1,0 +1,105 @@
+---
+- name: Create /etc/docker directory
+  file:
+    path: /etc/docker
+    state: directory
+    mode: '0755'
+
+- name: Create Docker configuration file
+  copy:
+    dest: /etc/docker/daemon.json
+    content: |
+      {
+        "bip": "192.168.67.1/24",
+        "fixed-cidr": "192.168.67.0/24",
+        "storage-driver": "overlay2",
+        "default-address-pools": [
+          {
+            "base": "192.168.167.1/24",
+            "size": 24
+          },
+          {
+            "base": "192.168.168.1/24",
+            "size": 24
+          },
+          {
+            "base": "192.168.169.1/24",
+            "size": 24
+          },
+          {
+            "base": "192.168.170.1/24",
+            "size": 24
+          },
+          {
+            "base": "192.168.171.1/24",
+            "size": 24
+          },
+          {
+            "base": "192.168.172.1/24",
+            "size": 24
+          },
+          {
+            "base": "192.168.173.1/24",
+            "size": 24
+          },
+          {
+            "base": "192.168.174.1/24",
+            "size": 24
+          }
+        ]
+      }
+    mode: '0644'
+
+- name: Install Docker
+  dnf:
+    name: docker-ce
+    state: present
+
+- name: Ensure Docker is started and enabled
+  systemd:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Open ports
+  firewalld:
+    port: "5005/tcp"
+    state: enabled
+    permanent: yes
+
+- name: restart firewalld
+  systemd:
+    daemon_reload: yes
+    name: firewalld
+    state: restarted
+    enabled: yes
+
+- name: Add A record for container proxy
+  lineinfile:
+    path: "/etc/named/{{ hostname }}{{ domain_name }}"
+    line: 'container-proxy.{{ hostname }}{{ domain_name }}.  IN  A {{ external_ip }}'
+
+- name: Add VirtualHost configuration
+  ansible.builtin.lineinfile:
+    path: "/etc/httpd/conf.d/www.{{ hostname }}{{ domain_name }}.conf"
+    line: |
+      <VirtualHost *:80>
+          ServerName container-proxy.{{ hostname }}{{ domain_name }}
+          # ServerName sets the name to listen for with requests
+          ErrorLog /var/log/httpd/container-proxy-error_log
+          CustomLog /var/log/httpd/container-proxy-access_log common
+          ForensicLog /var/log/httpd/container-proxy-forensic_log
+
+          ProxyPreserveHost On
+
+          ProxyPass / http://{{ container_ip}}:5000/
+          ProxyPassReverse / http://{{ container_ip}}:5000/      
+      </VirtualHost>
+    state: present
+
+- name: restart httpd
+  systemd:
+    daemon_reload: yes
+    name: httpd
+    state: restarted
+    enabled: yes

@@ -1,0 +1,3 @@
+[localhost]
+
+localhost hostname=nikitafilinvm domain_name=.sa.cs.ut.ee short_ip=89.17.172 external_ip=172.17.89.83 container_ip=192.168.67.3
